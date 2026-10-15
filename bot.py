@@ -66,14 +66,6 @@ PRODUCTS = {
         "channel_env": "CH_MUSIC",
         "default_days": 30,
     },
-    "db": {
-        "name": "🗄 DMT B2B DB Transfer (Contact Admin)",
-        "price": "Contact admin",
-        "terms": "",
-        "channel_env": "CH_DB",
-        "default_days": 30,
-        "url": CONTACT_URL,
-    },
 }
 DURATION_OPTIONS = [7, 15, 30, 60, 90, 180, 365]
 REMINDER_BEFORE_DAYS = 2
@@ -141,6 +133,7 @@ def home_markup():
             rows.append([InlineKeyboardButton(p["name"], url=p["url"])])
         else:
             rows.append([InlineKeyboardButton(p["name"], callback_data=f"p:{k}")])
+    rows.append([InlineKeyboardButton("💬 Contact Admin", url=CONTACT_URL)])
     rows.append([InlineKeyboardButton("📋 My Subscriptions", callback_data="my")])
     return InlineKeyboardMarkup(rows)
 
