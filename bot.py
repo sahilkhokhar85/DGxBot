@@ -4,11 +4,11 @@ import html
 import io
 import logging
 import os
-import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from pymongo import AsyncMongoClient, ReturnDocument
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter
@@ -28,8 +28,9 @@ log = logging.getLogger("premium-bot")
 
 # ------------------------------------------------------------------ CONFIG
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+MONGO_URI = os.environ["MONGO_URI"]
+MONGO_DB = os.getenv("MONGO_DB", "premiumbot")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split()}
-DB_PATH = os.getenv("DB_PATH", "bot.db")
 UPI_ID = os.getenv("UPI_ID", "luffytaroxzmanish@fam")
 CONTACT_URL = "https://t.me/DGHelps_Bot"
 IST = ZoneInfo("Asia/Kolkata")
@@ -103,81 +104,53 @@ def channel_of(key):
 
 
 # ---------------------------------------------------------------------- DB
-def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+# MongoDB collections: users, requests, subs, banned, settings, counters
+client = None
+db = None
 
 
-def init_db():
-    d = os.path.dirname(DB_PATH)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with conn() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS requests(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER, username TEXT, full_name TEXT,
-                product TEXT, status TEXT DEFAULT 'pending',
-                file_id TEXT, created_at INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS subs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER, product TEXT,
-                start_ts INTEGER, expiry_ts INTEGER,
-                active INTEGER DEFAULT 1, reminded INTEGER DEFAULT 0,
-                UNIQUE(user_id, product)
-            );
-            CREATE TABLE IF NOT EXISTS users(
-                user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT
-            );
-            CREATE TABLE IF NOT EXISTS banned(user_id INTEGER PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-            """
-        )
-        # naye columns (purane database par bhi safe)
-        for tbl, col, typ in [
-            ("requests", "plan_secs", "INTEGER"),
-            ("requests", "plan_label", "TEXT"),
-            ("requests", "plan_price", "INTEGER"),
-            ("users", "first_seen", "INTEGER"),
-            ("users", "last_seen", "INTEGER"),
-        ]:
-            try:
-                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
-            except sqlite3.OperationalError:
-                pass
-        # purane 'tv' plan ko 'movies' mein merge karo (ab dono ek hi channel)
-        c.execute("UPDATE OR IGNORE subs SET product='movies' WHERE product='tv'")
-        c.execute("DELETE FROM subs WHERE product='tv'")
-        c.execute("UPDATE requests SET product='movies' WHERE product='tv'")
+async def post_init(app):
+    global client, db
+    client = AsyncMongoClient(MONGO_URI, serverSelectionTimeoutMS=15000)
+    db = client[MONGO_DB]
+    await client.admin.command("ping")
+    log.info("MongoDB connected (db=%s)", MONGO_DB)
 
 
-def get_setting(key):
-    with conn() as c:
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+async def post_shutdown(app):
+    if client is not None:
+        await client.close()
+
+
+async def next_req_id():
+    doc = await db.counters.find_one_and_update(
+        {"_id": "requests"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["seq"]
+
+
+async def get_setting(key):
+    r = await db.settings.find_one({"_id": key})
     return r["value"] if r else None
 
 
-def set_setting(key, value):
-    with conn() as c:
-        c.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+async def set_setting(key, value):
+    await db.settings.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
 
 
-def touch_user(u):
+async def touch_user(u):
     now = int(time.time())
-    with conn() as c:
-        c.execute(
-            "INSERT INTO users(user_id,username,full_name,first_seen,last_seen) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
-            "full_name=excluded.full_name, last_seen=excluded.last_seen",
-            (u.id, u.username, u.full_name, now, now),
-        )
+    await db.users.update_one(
+        {"_id": u.id},
+        {
+            "$set": {"username": u.username, "full_name": u.full_name, "last_seen": now},
+            "$setOnInsert": {"first_seen": now},
+        },
+        upsert=True,
+    )
 
 
 def fmt(ts):
@@ -206,11 +179,10 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 
-def is_banned(uid):
+async def is_banned(uid):
     if is_admin(uid):
         return False
-    with conn() as c:
-        return c.execute("SELECT 1 FROM banned WHERE user_id=?", (uid,)).fetchone() is not None
+    return await db.banned.find_one({"_id": uid}) is not None
 
 
 def all_channels():
@@ -254,8 +226,8 @@ def home_markup():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    touch_user(u)
-    if is_banned(u.id):
+    await touch_user(u)
+    if await is_banned(u.id):
         await update.effective_message.reply_text("🚫 Aap is bot ko use nahi kar sakte.")
         return
     context.user_data.pop("buying", None)
@@ -271,7 +243,7 @@ async def show_home(q):
 
 
 async def show_product(q, key):
-    """Page 1: plans + prices"""
+    """Page 1: plans (buttons mein)"""
     p = PRODUCTS[key]
     if p.get("contact"):
         text = f"<b>{p['name']}</b>\n\n📜 <b>Terms:</b>\n{esc(p['terms'])}"
@@ -308,7 +280,7 @@ async def show_payment(q, context, key, pid):
     if not pl:
         return
     context.user_data["buying"] = {"key": key, "plan": pid}
-    has_qr = bool(get_setting("qr_file_id"))
+    has_qr = bool(await get_setting("qr_file_id"))
     text = (
         f"<b>{PRODUCTS[key]['name']}</b>\n"
         f"📦 Plan: <b>{pl['label']} — ₹{pl['price']}</b>\n\n"
@@ -332,11 +304,9 @@ async def show_payment(q, context, key, pid):
 
 async def my_subs_text(user_id):
     now = int(time.time())
-    with conn() as c:
-        rows = c.execute(
-            "SELECT * FROM subs WHERE user_id=? AND active=1 AND expiry_ts>?",
-            (user_id, now),
-        ).fetchall()
+    rows = await db.subs.find(
+        {"user_id": user_id, "active": True, "expiry_ts": {"$gt": now}}
+    ).to_list(None)
     if not rows:
         return "Aapka koi active subscription nahi hai."
     lines = ["<b>📋 Aapke active plans:</b>\n"]
@@ -348,7 +318,7 @@ async def my_subs_text(user_id):
 
 
 async def mysubs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    touch_user(update.effective_user)
+    await touch_user(update.effective_user)
     await update.message.reply_text(
         await my_subs_text(update.effective_user.id), parse_mode=ParseMode.HTML
     )
@@ -357,11 +327,11 @@ async def mysubs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------- USER CALLBACKS
 async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if is_banned(q.from_user.id):
+    if await is_banned(q.from_user.id):
         await q.answer("🚫 Aap banned hain", show_alert=True)
         return
     if q.data == "qr":
-        fid = get_setting("qr_file_id")
+        fid = await get_setting("qr_file_id")
         if not fid:
             await q.answer("QR abhi available nahi hai. UPI se payment karein.", show_alert=True)
             return
@@ -376,7 +346,7 @@ async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(q.from_user.id, fid, caption=cap)
         return
     await q.answer()
-    touch_user(q.from_user)
+    await touch_user(q.from_user)
     data = q.data
 
     if data == "home":
@@ -404,26 +374,35 @@ async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    if is_banned(u.id):
+    if await is_banned(u.id):
         return
-    touch_user(u)
+    await touch_user(u)
     buying = context.user_data.get("buying")
     if not buying:
         await update.message.reply_text("Pehle /start karke plan choose karein.")
         return
     key = buying["key"]
     pl = get_plan(key, buying["plan"])
+    if not pl:
+        await update.message.reply_text("Pehle /start karke plan choose karein.")
+        return
     file_id = update.message.photo[-1].file_id
-    with conn() as c:
-        cur = c.execute(
-            "INSERT INTO requests(user_id,username,full_name,product,file_id,created_at,"
-            "plan_secs,plan_label,plan_price) VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                u.id, u.username, u.full_name, key, file_id, int(time.time()),
-                pl["secs"], pl["label"], pl["price"],
-            ),
-        )
-        req_id = cur.lastrowid
+    req_id = await next_req_id()
+    await db.requests.insert_one(
+        {
+            "_id": req_id,
+            "user_id": u.id,
+            "username": u.username,
+            "full_name": u.full_name,
+            "product": key,
+            "status": "pending",
+            "file_id": file_id,
+            "created_at": int(time.time()),
+            "plan_secs": pl["secs"],
+            "plan_label": pl["label"],
+            "plan_price": pl["price"],
+        }
+    )
     context.user_data.pop("buying", None)
 
     await update.message.reply_text(
@@ -456,9 +435,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------- ADMIN CALLBACKS
-def get_req(req_id):
-    with conn() as c:
-        return c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
+async def get_req(req_id):
+    return await db.requests.find_one({"_id": req_id})
 
 
 def duration_keyboard(req_id):
@@ -483,7 +461,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     parts = q.data.split(":")
     action, req_id = parts[0], int(parts[1])
-    req = get_req(req_id)
+    req = await get_req(req_id)
     if not req or req["status"] != "pending":
         try:
             await q.edit_message_reply_markup(None)
@@ -493,9 +471,9 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "ap":
-        if req["plan_secs"]:
+        if req.get("plan_secs"):
             await finalize(q, context, req_id, int(req["plan_secs"]))
-        else:  # purani request jisme plan nahi tha
+        else:
             await q.edit_message_reply_markup(duration_keyboard(req_id))
 
     elif action == "chg":
@@ -511,8 +489,9 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finalize(q, context, req_id, int(parts[2]))
 
     elif action == "rj":
-        with conn() as c:
-            c.execute("UPDATE requests SET status='rejected' WHERE id=?", (req_id,))
+        await db.requests.update_one(
+            {"_id": req_id, "status": "pending"}, {"$set": {"status": "rejected"}}
+        )
         await q.edit_message_caption(
             (q.message.caption_html or "") + "\n\n❌ <b>Rejected</b>",
             parse_mode=ParseMode.HTML,
@@ -528,34 +507,37 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def finalize(q, context, req_id, secs):
     now = int(time.time())
-    with conn() as c:
-        cur = c.execute(
-            "UPDATE requests SET status='approved' WHERE id=? AND status='pending'",
-            (req_id,),
-        )
-        if cur.rowcount == 0:
-            return "Request pehle hi handle ho chuki hai."
-        req = c.execute("SELECT * FROM requests WHERE id=?", (req_id,)).fetchone()
-        key, uid = req["product"], req["user_id"]
-        sub = c.execute(
-            "SELECT * FROM subs WHERE user_id=? AND product=?", (uid, key)
-        ).fetchone()
-        if sub and sub["active"] and sub["expiry_ts"] > now:
-            start, base = sub["start_ts"], sub["expiry_ts"]  # renew: extend
-        else:
-            start, base = now, now
-        expiry = base + secs
-        reminded = 1 if expiry - now <= REMINDER_BEFORE_DAYS * DAY else 0
-        if sub:
-            c.execute(
-                "UPDATE subs SET start_ts=?, expiry_ts=?, active=1, reminded=? WHERE id=?",
-                (start, expiry, reminded, sub["id"]),
-            )
-        else:
-            c.execute(
-                "INSERT INTO subs(user_id,product,start_ts,expiry_ts,reminded) VALUES(?,?,?,?,?)",
-                (uid, key, start, expiry, reminded),
-            )
+    # atomic: sirf ek hi baar approve ho (double click safe)
+    res = await db.requests.update_one(
+        {"_id": req_id, "status": "pending"}, {"$set": {"status": "approved"}}
+    )
+    if res.modified_count == 0:
+        return "Request pehle hi handle ho chuki hai."
+    req = await db.requests.find_one({"_id": req_id})
+    key, uid = req["product"], req["user_id"]
+
+    sub_id = f"{uid}:{key}"
+    sub = await db.subs.find_one({"_id": sub_id})
+    if sub and sub.get("active") and sub["expiry_ts"] > now:
+        start, base = sub["start_ts"], sub["expiry_ts"]  # renew: extend
+    else:
+        start, base = now, now
+    expiry = base + secs
+    reminded = expiry - now <= REMINDER_BEFORE_DAYS * DAY
+    await db.subs.update_one(
+        {"_id": sub_id},
+        {
+            "$set": {
+                "user_id": uid,
+                "product": key,
+                "start_ts": start,
+                "expiry_ts": expiry,
+                "active": True,
+                "reminded": reminded,
+            }
+        },
+        upsert=True,
+    )
 
     text = (
         f"✅ <b>Payment approved!</b>\n\n📦 {PRODUCTS[key]['name']}\n"
@@ -600,8 +582,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await finalize(None, context, req_id, int(t) * DAY)
         await update.message.reply_text(res, parse_mode=ParseMode.HTML)
         return
-    if not is_banned(update.effective_user.id):
-        touch_user(update.effective_user)
+    if not await is_banned(update.effective_user.id):
+        await touch_user(update.effective_user)
         await update.message.reply_text("/start dabake menu kholein.")
 
 
@@ -610,19 +592,19 @@ async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     now = int(time.time())
-    with conn() as c:
-        rows = c.execute(
-            "SELECT s.*, u.username, u.full_name FROM subs s LEFT JOIN users u USING(user_id)"
-            " WHERE s.active=1 AND s.expiry_ts>? ORDER BY s.expiry_ts",
-            (now,),
-        ).fetchall()
+    rows = await db.subs.find(
+        {"active": True, "expiry_ts": {"$gt": now}}
+    ).to_list(None)
+    rows.sort(key=lambda r: r["expiry_ts"])
     if not rows:
         await update.message.reply_text("Koi active subscriber nahi.")
         return
+    users = {u["_id"]: u for u in await db.users.find({}).to_list(None)}
     lines = [f"<b>Active subscribers ({len(rows)})</b>\n"]
     for r in rows:
+        u = users.get(r["user_id"], {})
         lines.append(
-            f"• {esc(r['full_name'])} (@{esc(r['username']) or '-'}) <code>{r['user_id']}</code>\n"
+            f"• {esc(u.get('full_name'))} (@{esc(u.get('username')) or '-'}) <code>{r['user_id']}</code>\n"
             f"  {pname(r['product'])} → {fmt(r['expiry_ts'])}"
         )
     text = "\n".join(lines)
@@ -634,28 +616,26 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     now = int(time.time())
-    with conn() as c:
-        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        pending = c.execute(
-            "SELECT COUNT(*) FROM requests WHERE status='pending'"
-        ).fetchone()[0]
-        per = c.execute(
-            "SELECT product, COUNT(*) n FROM subs WHERE active=1 AND expiry_ts>? GROUP BY product",
-            (now,),
-        ).fetchall()
-        paid_n, paid_sum = c.execute(
-            "SELECT COUNT(*), COALESCE(SUM(plan_price),0) FROM requests WHERE status='approved'"
-        ).fetchone()
-        banned = c.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
+    users = await db.users.count_documents({})
+    pending = await db.requests.count_documents({"status": "pending"})
+    banned = await db.banned.count_documents({})
+    approved = await db.requests.find({"status": "approved"}).to_list(None)
+    paid_sum = sum(r.get("plan_price") or 0 for r in approved)
+    active = await db.subs.find(
+        {"active": True, "expiry_ts": {"$gt": now}}
+    ).to_list(None)
+    per = {}
+    for s in active:
+        per[s["product"]] = per.get(s["product"], 0) + 1
     lines = [
         f"👥 Total users: {users}",
         f"🚫 Banned: {banned}",
         f"⏳ Pending requests: {pending}",
-        f"💰 Approved payments: {paid_n} (₹{paid_sum})",
+        f"💰 Approved payments: {len(approved)} (₹{paid_sum})",
         "",
         "Active subs:",
     ]
-    lines += [f"• {pname(r['product'])}: {r['n']}" for r in per] or ["• none"]
+    lines += [f"• {pname(k)}: {n}" for k, n in per.items()] or ["• none"]
     await update.message.reply_text("\n".join(lines))
 
 
@@ -668,31 +648,28 @@ async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = int(context.args[0])
     now = int(time.time())
-    with conn() as c:
-        u = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        subs = c.execute("SELECT * FROM subs WHERE user_id=?", (uid,)).fetchall()
-        n_req, paid = c.execute(
-            "SELECT COUNT(*), COALESCE(SUM(plan_price),0) FROM requests WHERE user_id=? AND status='approved'",
-            (uid,),
-        ).fetchone()
-        banned = c.execute("SELECT 1 FROM banned WHERE user_id=?", (uid,)).fetchone()
+    u = await db.users.find_one({"_id": uid})
+    subs = await db.subs.find({"user_id": uid}).to_list(None)
+    approved = await db.requests.find({"user_id": uid, "status": "approved"}).to_list(None)
+    paid = sum(r.get("plan_price") or 0 for r in approved)
+    banned = await db.banned.find_one({"_id": uid})
     if not u and not subs:
         await update.message.reply_text("Ye user database mein nahi mila.")
         return
     lines = [f"🆔 {uid}"]
     if u:
-        lines.append(f"👤 {u['full_name']} (@{u['username'] or '-'})")
-        if u["first_seen"]:
+        lines.append(f"👤 {u.get('full_name')} (@{u.get('username') or '-'})")
+        if u.get("first_seen"):
             lines.append(f"📅 Pehli baar: {fmt(u['first_seen'])}")
-        if u["last_seen"]:
+        if u.get("last_seen"):
             lines.append(f"🕒 Last active: {fmt(u['last_seen'])}")
     lines.append(f"🚫 Banned: {'Haan' if banned else 'Nahi'}")
-    lines.append(f"💰 Approved payments: {n_req} (₹{paid})")
+    lines.append(f"💰 Approved payments: {len(approved)} (₹{paid})")
     lines.append("")
     if subs:
         lines.append("Subscriptions:")
         for s in subs:
-            live = s["active"] and s["expiry_ts"] > now
+            live = s.get("active") and s["expiry_ts"] > now
             lines.append(
                 f"• {pname(s['product'])}: {'ACTIVE' if live else 'expired'} — {fmt(s['expiry_ts'])}"
             )
@@ -702,23 +679,17 @@ async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saare users ka CSV (database backup jaisa)"""
+    """Saare users ka CSV (backup jaisa)"""
     if not is_admin(update.effective_user.id):
         return
     now = int(time.time())
-    with conn() as c:
-        users = c.execute("SELECT * FROM users").fetchall()
-        subs = c.execute(
-            "SELECT * FROM subs WHERE active=1 AND expiry_ts>?", (now,)
-        ).fetchall()
-        paid = {
-            r["user_id"]: r["t"]
-            for r in c.execute(
-                "SELECT user_id, COALESCE(SUM(plan_price),0) t FROM requests "
-                "WHERE status='approved' GROUP BY user_id"
-            )
-        }
-        banned = {r[0] for r in c.execute("SELECT user_id FROM banned")}
+    users = await db.users.find({}).to_list(None)
+    subs = await db.subs.find({"active": True, "expiry_ts": {"$gt": now}}).to_list(None)
+    approved = await db.requests.find({"status": "approved"}).to_list(None)
+    banned = {b["_id"] for b in await db.banned.find({}).to_list(None)}
+    paid = {}
+    for r in approved:
+        paid[r["user_id"]] = paid.get(r["user_id"], 0) + (r.get("plan_price") or 0)
     active = {}
     for s in subs:
         active.setdefault(s["user_id"], []).append(
@@ -732,14 +703,14 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in users:
         w.writerow(
             [
-                u["user_id"],
-                u["username"] or "",
-                u["full_name"] or "",
-                fmt(u["first_seen"]) if u["first_seen"] else "",
-                fmt(u["last_seen"]) if u["last_seen"] else "",
-                "yes" if u["user_id"] in banned else "no",
-                paid.get(u["user_id"], 0),
-                " | ".join(active.get(u["user_id"], [])),
+                u["_id"],
+                u.get("username") or "",
+                u.get("full_name") or "",
+                fmt(u["first_seen"]) if u.get("first_seen") else "",
+                fmt(u["last_seen"]) if u.get("last_seen") else "",
+                "yes" if u["_id"] in banned else "no",
+                paid.get(u["_id"], 0),
+                " | ".join(active.get(u["_id"], [])),
             ]
         )
     data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
@@ -759,10 +730,7 @@ async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid, key = int(context.args[0]), context.args[1]
     await kick(context, uid, key)
-    with conn() as c:
-        c.execute(
-            "UPDATE subs SET active=0 WHERE user_id=? AND product=?", (uid, key)
-        )
+    await db.subs.update_one({"_id": f"{uid}:{key}"}, {"$set": {"active": False}})
     await update.message.reply_text("Done ✅")
 
 
@@ -777,11 +745,9 @@ async def resend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid, key = int(context.args[0]), context.args[1]
     now = int(time.time())
-    with conn() as c:
-        sub = c.execute(
-            "SELECT * FROM subs WHERE user_id=? AND product=? AND active=1 AND expiry_ts>?",
-            (uid, key, now),
-        ).fetchone()
+    sub = await db.subs.find_one(
+        {"_id": f"{uid}:{key}", "active": True, "expiry_ts": {"$gt": now}}
+    )
     if not sub:
         await update.message.reply_text("Is user ka is plan mein active subscription nahi hai.")
         return
@@ -808,9 +774,10 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(uid):
         await update.message.reply_text("Admin ko ban nahi kar sakte.")
         return
-    with conn() as c:
-        c.execute("INSERT OR IGNORE INTO banned VALUES(?)", (uid,))
-        c.execute("UPDATE subs SET active=0 WHERE user_id=?", (uid,))
+    await db.banned.update_one(
+        {"_id": uid}, {"$setOnInsert": {"at": int(time.time())}}, upsert=True
+    )
+    await db.subs.update_many({"user_id": uid}, {"$set": {"active": False}})
     lines = [f"🚫 {uid} banned (bot + subscriptions band)."]
     for ch in all_channels():
         try:
@@ -829,8 +796,7 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use: /unban <user_id>")
         return
     uid = int(context.args[0])
-    with conn() as c:
-        c.execute("DELETE FROM banned WHERE user_id=?", (uid,))
+    await db.banned.delete_one({"_id": uid})
     lines = [f"✅ {uid} unbanned."]
     for ch in all_channels():
         try:
@@ -854,13 +820,8 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use:\n/broadcast <message>\nYa kisi message ko reply karke /broadcast likho."
         )
         return
-    with conn() as c:
-        ids = [
-            r[0]
-            for r in c.execute(
-                "SELECT user_id FROM users WHERE user_id NOT IN (SELECT user_id FROM banned)"
-            )
-        ]
+    banned = {b["_id"] for b in await db.banned.find({}).to_list(None)}
+    ids = [u["_id"] for u in await db.users.find({}).to_list(None) if u["_id"] not in banned]
     await msg.reply_text(f"📢 Broadcast shuru: {len(ids)} users...")
 
     async def run():
@@ -922,21 +883,20 @@ async def setqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "QR ki photo bhejo aur caption mein /setqr likho, ya photo par reply karke /setqr likho."
         )
         return
-    set_setting("qr_file_id", r.photo[-1].file_id)
+    await set_setting("qr_file_id", r.photo[-1].file_id)
     await update.message.reply_text("✅ QR set ho gaya. Ab payment page par QR-CODE button dikhega.")
 
 
 async def setqr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Photo bhejo caption /setqr ke saath (sirf admin)"""
-    set_setting("qr_file_id", update.message.photo[-1].file_id)
+    await set_setting("qr_file_id", update.message.photo[-1].file_id)
     await update.message.reply_text("✅ QR set ho gaya. Ab payment page par QR-CODE button dikhega.")
 
 
 async def removeqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    with conn() as c:
-        c.execute("DELETE FROM settings WHERE key='qr_file_id'")
+    await db.settings.delete_one({"_id": "qr_file_id"})
     await update.message.reply_text("QR hata diya.")
 
 
@@ -983,14 +943,14 @@ async def kick(context, uid, key):
 
 async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
-    with conn() as c:
-        expired = c.execute(
-            "SELECT * FROM subs WHERE active=1 AND expiry_ts<=?", (now,)
-        ).fetchall()
-        remind = c.execute(
-            "SELECT * FROM subs WHERE active=1 AND reminded=0 AND expiry_ts>? AND expiry_ts<=?",
-            (now, now + REMINDER_BEFORE_DAYS * DAY),
-        ).fetchall()
+    expired = await db.subs.find({"active": True, "expiry_ts": {"$lte": now}}).to_list(None)
+    remind = await db.subs.find(
+        {
+            "active": True,
+            "reminded": False,
+            "expiry_ts": {"$gt": now, "$lte": now + REMINDER_BEFORE_DAYS * DAY},
+        }
+    ).to_list(None)
 
     for r in remind:
         kb = InlineKeyboardMarkup(
@@ -1006,14 +966,18 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-        with conn() as c:
-            c.execute("UPDATE subs SET reminded=1 WHERE id=?", (r["id"],))
+        await db.subs.update_one({"_id": r["_id"]}, {"$set": {"reminded": True}})
 
     for r in expired:
         key, uid = r["product"], r["user_id"]
+        # sirf tab expire karo jab beech mein renew na hua ho
+        res = await db.subs.update_one(
+            {"_id": r["_id"], "expiry_ts": r["expiry_ts"], "active": True},
+            {"$set": {"active": False}},
+        )
+        if res.modified_count == 0:
+            continue
         await kick(context, uid, key)
-        with conn() as c:
-            c.execute("UPDATE subs SET active=0 WHERE id=?", (r["id"],))
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔄 Re-new Subscription", callback_data=f"p:{key}")]]
         )
@@ -1042,10 +1006,15 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not ADMIN_IDS:
         raise SystemExit("ADMIN_IDS env variable set karo")
-    init_db()
     for k, p in PRODUCTS.items():
         log.info("Channel %s (%s) = %s", p["channel_env"], k, channel_of(k))
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     for name, fn in [
         ("start", start),
