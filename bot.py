@@ -24,11 +24,12 @@ log = logging.getLogger("premium-bot")
 
 # ------------------------------------------------------------------ CONFIG
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split()}
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 PAYMENT_INFO = os.getenv(
     "PAYMENT_INFO", "UPI ID: yourupi@bank\n(Payment ke baad screenshot yahin bhejein)"
 )
+CONTACT_URL = "https://t.me/DGHelps_Bot"
 IST = ZoneInfo("Asia/Kolkata")
 DAY = 86400
 
@@ -51,11 +52,12 @@ PRODUCTS = {
         "default_days": 30,
     },
     "courses": {
-        "name": "📚 DMT Courses (Soon)",
-        "price": "Coming soon",
-        "terms": "• Details jald aayengi",
+        "name": "📚 DMT Courses",
+        "price": "Adding Soon",
+        "terms": "• Courses jald add honge\n• Details ke liye admin se contact karein: @DGHelps_Bot",
         "channel_env": "CH_COURSES",
         "default_days": 30,
+        "contact": True,
     },
     "music": {
         "name": "🎧 DMT Immersive Music",
@@ -65,11 +67,12 @@ PRODUCTS = {
         "default_days": 30,
     },
     "db": {
-        "name": "🗄 DMT B2B DB Transfer",
+        "name": "🗄 DMT B2B DB Transfer (Contact Admin)",
         "price": "Contact admin",
-        "terms": "• Pricing requirement ke hisaab se\n• Admin se baat karein",
+        "terms": "",
         "channel_env": "CH_DB",
         "default_days": 30,
+        "url": CONTACT_URL,
     },
 }
 DURATION_OPTIONS = [7, 15, 30, 60, 90, 180, 365]
@@ -78,7 +81,10 @@ REMINDER_BEFORE_DAYS = 2
 
 def channel_of(key):
     v = os.getenv(PRODUCTS[key]["channel_env"], "").strip()
-    return int(v) if v else None
+    try:
+        return int(v)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------- DB
@@ -129,10 +135,12 @@ def is_admin(uid):
 
 # -------------------------------------------------------------------- MENUS
 def home_markup():
-    rows = [
-        [InlineKeyboardButton(p["name"], callback_data=f"p:{k}")]
-        for k, p in PRODUCTS.items()
-    ]
+    rows = []
+    for k, p in PRODUCTS.items():
+        if p.get("url"):
+            rows.append([InlineKeyboardButton(p["name"], url=p["url"])])
+        else:
+            rows.append([InlineKeyboardButton(p["name"], callback_data=f"p:{k}")])
     rows.append([InlineKeyboardButton("📋 My Subscriptions", callback_data="my")])
     return InlineKeyboardMarkup(rows)
 
@@ -166,11 +174,12 @@ async def show_product(q, key):
         f"💰 <b>Price:</b> {esc(p['price'])}\n\n"
         f"📜 <b>Terms:</b>\n{esc(p['terms'])}"
     )
+    if p.get("contact"):
+        action = InlineKeyboardButton("💬 Contact Admin", url=CONTACT_URL)
+    else:
+        action = InlineKeyboardButton("💳 Buy Now", callback_data=f"buy:{key}")
     kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💳 Buy Now", callback_data=f"buy:{key}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="home")],
-        ]
+        [[action], [InlineKeyboardButton("⬅️ Back", callback_data="home")]]
     )
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -221,6 +230,8 @@ async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_product(q, data[2:])
     elif data.startswith("buy:"):
         key = data[4:]
+        if PRODUCTS[key].get("contact") or PRODUCTS[key].get("url"):
+            return
         context.user_data["buying"] = key
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Cancel", callback_data=f"p:{key}")]]
