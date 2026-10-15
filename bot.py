@@ -133,6 +133,7 @@ def init_db():
                 user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT
             );
             CREATE TABLE IF NOT EXISTS banned(user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             """
         )
         # naye columns (purane database par bhi safe)
@@ -151,6 +152,21 @@ def init_db():
         c.execute("UPDATE OR IGNORE subs SET product='movies' WHERE product='tv'")
         c.execute("DELETE FROM subs WHERE product='tv'")
         c.execute("UPDATE requests SET product='movies' WHERE product='tv'")
+
+
+def get_setting(key):
+    with conn() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else None
+
+
+def set_setting(key, value):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
 
 def touch_user(u):
@@ -292,19 +308,26 @@ async def show_payment(q, context, key, pid):
     if not pl:
         return
     context.user_data["buying"] = {"key": key, "plan": pid}
+    has_qr = bool(get_setting("qr_file_id"))
     text = (
         f"<b>{PRODUCTS[key]['name']}</b>\n"
         f"📦 Plan: <b>{pl['label']} — ₹{pl['price']}</b>\n\n"
         "<b>Select Your Payout METHOD</b>\n\n"
         '1. UPI :- "Tap👇Karke Copy Karein"\n'
         f"→ <code>{esc(UPI_ID)}</code>\n\n"
-        "2. Binance Pay :- (Adding Soon)\n\n"
-        "(Payment ke baad yahin <b>screenshot (photo)</b> bhejein)"
     )
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⬅️ Back / Cancel", callback_data=f"p:{key}")]]
+    n = 2
+    rows = []
+    if has_qr:
+        text += f'{n}. Scan QR Code 👇\nView QR: => "QR-CODE"\n\n'
+        rows.append([InlineKeyboardButton("QR-CODE", callback_data="qr")])
+        n += 1
+    text += f"{n}. Binance Pay :- (Adding Soon)\n\n"
+    text += "(Payment ke baad yahin <b>screenshot (photo)</b> bhejein)"
+    rows.append([InlineKeyboardButton("⬅️ Back / Cancel", callback_data=f"p:{key}")])
+    await q.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML
     )
-    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def my_subs_text(user_id):
@@ -336,6 +359,21 @@ async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if is_banned(q.from_user.id):
         await q.answer("🚫 Aap banned hain", show_alert=True)
+        return
+    if q.data == "qr":
+        fid = get_setting("qr_file_id")
+        if not fid:
+            await q.answer("QR abhi available nahi hai. UPI se payment karein.", show_alert=True)
+            return
+        await q.answer()
+        cap = "📷 QR scan karke payment karein"
+        buying = context.user_data.get("buying")
+        if buying:
+            pl = get_plan(buying["key"], buying["plan"])
+            if pl:
+                cap += f" — {pl['label']} ₹{pl['price']}"
+        cap += "\n\nPayment ke baad yahin screenshot (photo) bhejein."
+        await context.bot.send_photo(q.from_user.id, fid, caption=cap)
         return
     await q.answer()
     touch_user(q.from_user)
@@ -874,6 +912,34 @@ async def checkchannels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def setqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """QR photo par reply karke /setqr likho"""
+    if not is_admin(update.effective_user.id):
+        return
+    r = update.message.reply_to_message
+    if not r or not r.photo:
+        await update.message.reply_text(
+            "QR ki photo bhejo aur caption mein /setqr likho, ya photo par reply karke /setqr likho."
+        )
+        return
+    set_setting("qr_file_id", r.photo[-1].file_id)
+    await update.message.reply_text("✅ QR set ho gaya. Ab payment page par QR-CODE button dikhega.")
+
+
+async def setqr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Photo bhejo caption /setqr ke saath (sirf admin)"""
+    set_setting("qr_file_id", update.message.photo[-1].file_id)
+    await update.message.reply_text("✅ QR set ho gaya. Ab payment page par QR-CODE button dikhega.")
+
+
+async def removeqr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    with conn() as c:
+        c.execute("DELETE FROM settings WHERE key='qr_file_id'")
+    await update.message.reply_text("QR hata diya.")
+
+
 async def forwarded_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin kisi channel ka message bot ko forward kare -> channel ID mil jayegi"""
     if not is_admin(update.effective_user.id):
@@ -994,6 +1060,8 @@ def main():
         ("unban", unban_cmd),
         ("broadcast", broadcast_cmd),
         ("checkchannels", checkchannels_cmd),
+        ("setqr", setqr_cmd),
+        ("removeqr", removeqr_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
 
@@ -1006,6 +1074,14 @@ def main():
         MessageHandler(
             filters.UpdateType.CHANNEL_POSTS & filters.Regex(r"^/id(@\w+)?$"),
             channel_id_post,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO
+            & filters.CaptionRegex(r"^/setqr")
+            & filters.User(user_id=list(ADMIN_IDS)),
+            setqr_photo,
         )
     )
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
