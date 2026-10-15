@@ -1,13 +1,15 @@
+import asyncio
 import html
 import logging
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -109,6 +111,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT
             );
+            CREATE TABLE IF NOT EXISTS banned(user_id INTEGER PRIMARY KEY);
             """
         )
 
@@ -123,6 +126,29 @@ def esc(s):
 
 def is_admin(uid):
     return uid in ADMIN_IDS
+
+
+def is_banned(uid):
+    if is_admin(uid):
+        return False
+    with conn() as c:
+        return c.execute("SELECT 1 FROM banned WHERE user_id=?", (uid,)).fetchone() is not None
+
+
+def all_channels():
+    return sorted({channel_of(k) for k in PRODUCTS if channel_of(k)})
+
+
+async def make_invite(context, key):
+    ch = channel_of(key)
+    if not ch:
+        raise RuntimeError(f"{PRODUCTS[key]['channel_env']} Railway mein set nahi hai ya galat hai")
+    link = await context.bot.create_chat_invite_link(
+        ch,
+        member_limit=1,
+        expire_date=datetime.now(timezone.utc) + timedelta(days=1),
+    )
+    return link.invite_link
 
 
 # -------------------------------------------------------------------- MENUS
@@ -148,6 +174,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT OR REPLACE INTO users VALUES(?,?,?)",
             (u.id, u.username, u.full_name),
         )
+    if is_banned(u.id):
+        await update.effective_message.reply_text("🚫 Aap is bot ko use nahi kar sakte.")
+        return
     context.user_data.pop("buying", None)
     await update.effective_message.reply_text(
         HOME_TEXT, reply_markup=home_markup(), parse_mode=ParseMode.HTML
@@ -204,6 +233,9 @@ async def mysubs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------- USER CALLBACKS
 async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if is_banned(q.from_user.id):
+        await q.answer("🚫 Aap banned hain", show_alert=True)
+        return
     await q.answer()
     data = q.data
 
@@ -239,11 +271,13 @@ async def user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if is_banned(u.id):
+        return
     key = context.user_data.get("buying")
     if not key:
         await update.message.reply_text("Pehle /start karke plan choose karein.")
         return
-    u = update.effective_user
     file_id = update.message.photo[-1].file_id
     with conn() as c:
         cur = c.execute(
@@ -374,19 +408,17 @@ async def finalize(q, context, req_id, days, from_text_msg=None):
         f"✅ <b>Payment approved!</b>\n\n📦 {PRODUCTS[key]['name']}\n"
         f"🗓 Joining: {fmt(start)}\n⏳ Expiry: <b>{fmt(expiry)}</b>\n\n"
     )
-    ch = channel_of(key)
     link_note = ""
-    if ch:
+    if os.getenv(PRODUCTS[key]["channel_env"], "").strip():
         try:
-            link = await context.bot.create_chat_invite_link(
-                ch, member_limit=1, expire_date=now + DAY
-            )
-            text += f"🔗 Join link (1 baar, 24 ghante valid):\n{link.invite_link}"
+            link = await make_invite(context, key)
+            text += f"🔗 Join link (1 baar, 24 ghante valid):\n{link}"
         except Exception as e:
             log.error("Invite link fail: %s", e)
-            link_note = "\n⚠️ Invite link nahi ban paya (bot channel mein admin hai?). Manually bhejna padega."
+            link_note = f"\n⚠️ Invite link nahi bana: {e}\nManually link bhejna padega (/resend {uid} {key})"
             text += "Admin aapko jaldi channel link bhej denge."
     else:
+        link_note = f"\n⚠️ {PRODUCTS[key]['channel_env']} set nahi hai, isliye link nahi bana (/resend {uid} {key})"
         text += "Admin aapko jaldi access de denge."
     try:
         await context.bot.send_message(uid, text, parse_mode=ParseMode.HTML)
@@ -478,6 +510,142 @@ async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Done ✅")
 
 
+async def resend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resend <user_id> <product> -> active subscriber ko naya join link"""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) != 2 or context.args[1] not in PRODUCTS or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Use: /resend <user_id> <product>\nProducts: " + ", ".join(PRODUCTS)
+        )
+        return
+    uid, key = int(context.args[0]), context.args[1]
+    try:
+        link = await make_invite(context, key)
+        await context.bot.send_message(
+            uid,
+            f"🔗 {PRODUCTS[key]['name']} join link (1 baar, 24 ghante valid):\n{link}",
+        )
+        await update.message.reply_text("Link bhej diya ✅")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fail: {e}")
+
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ban <user_id> -> sab channels se ban + bot use band + subscriptions band"""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /ban <user_id>")
+        return
+    uid = int(context.args[0])
+    if is_admin(uid):
+        await update.message.reply_text("Admin ko ban nahi kar sakte.")
+        return
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO banned VALUES(?)", (uid,))
+        c.execute("UPDATE subs SET active=0 WHERE user_id=?", (uid,))
+    lines = [f"🚫 {uid} banned (bot + subscriptions band)."]
+    for ch in all_channels():
+        try:
+            await context.bot.ban_chat_member(ch, uid)
+            lines.append(f"✅ channel {ch}: banned")
+        except Exception as e:
+            lines.append(f"❌ channel {ch}: {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unban <user_id> -> channels se unban + bot use wapas"""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Use: /unban <user_id>")
+        return
+    uid = int(context.args[0])
+    with conn() as c:
+        c.execute("DELETE FROM banned WHERE user_id=?", (uid,))
+    lines = [f"✅ {uid} unbanned."]
+    for ch in all_channels():
+        try:
+            await context.bot.unban_chat_member(ch, uid, only_if_banned=True)
+            lines.append(f"✅ channel {ch}: unbanned")
+        except Exception as e:
+            lines.append(f"❌ channel {ch}: {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <text>  ya  kisi message ko reply karke /broadcast (photo/video bhi chalega)"""
+    if not is_admin(update.effective_user.id):
+        return
+    msg = update.message
+    reply = msg.reply_to_message
+    parts = msg.text.split(maxsplit=1)
+    text = parts[1] if len(parts) > 1 else ""
+    if not reply and not text:
+        await msg.reply_text(
+            "Use:\n/broadcast <message>\nYa kisi message ko reply karke /broadcast likho."
+        )
+        return
+    with conn() as c:
+        ids = [
+            r[0]
+            for r in c.execute(
+                "SELECT user_id FROM users WHERE user_id NOT IN (SELECT user_id FROM banned)"
+            )
+        ]
+    await msg.reply_text(f"📢 Broadcast shuru: {len(ids)} users...")
+
+    async def run():
+        sent = failed = 0
+        for uid in ids:
+            for attempt in range(2):
+                try:
+                    if reply:
+                        await context.bot.copy_message(uid, reply.chat_id, reply.message_id)
+                    else:
+                        await context.bot.send_message(uid, text)
+                    sent += 1
+                    break
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except Exception:
+                    failed += 1
+                    break
+            await asyncio.sleep(0.05)
+        await context.bot.send_message(
+            update.effective_user.id, f"📢 Broadcast done ✅\nSent: {sent}\nFailed: {failed}"
+        )
+
+    context.application.create_task(run())
+
+
+async def checkchannels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Har channel ka status: ID set hai? bot admin hai? invite/ban permission hai?"""
+    if not is_admin(update.effective_user.id):
+        return
+    me = await context.bot.get_me()
+    lines = []
+    for key, p in PRODUCTS.items():
+        env = p["channel_env"]
+        ch = channel_of(key)
+        if not ch:
+            lines.append(f"• {p['name']}: {env} set nahi hai")
+            continue
+        try:
+            chat = await context.bot.get_chat(ch)
+            m = await context.bot.get_chat_member(ch, me.id)
+            inv = getattr(m, "can_invite_users", None)
+            ban = getattr(m, "can_restrict_members", None)
+            lines.append(
+                f"• {p['name']}: {chat.title} ({ch})\n   bot={m.status}, invite={inv}, ban={ban}"
+            )
+        except Exception as e:
+            lines.append(f"• {p['name']}: ❌ {ch} -> {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
 # --------------------------------------------------------------- EXPIRY JOB
 async def kick(context, uid, key):
     ch = channel_of(key)
@@ -559,6 +727,11 @@ def main():
     app.add_handler(CommandHandler("subs", subs_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
+    app.add_handler(CommandHandler("resend", resend_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("checkchannels", checkchannels_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^(ap|rj|cd|dur):"))
     app.add_handler(CallbackQueryHandler(user_cb))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
