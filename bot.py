@@ -220,7 +220,10 @@ def link_ttl_text(ttl):
 
 
 # -------------------------------------------------------------------- MENUS
-HOME_TEXT = "👋 <b>Welcome!</b>\n\nNeeche se apna premium plan choose karein 👇"
+HOME_TEXT = (
+    "👋 <b>Welcome!</b>\n\nNeeche se apna premium plan choose karein 👇\n\n"
+    "🗄 <b>Database channel</b> ke liye admin ko contact karein."
+)
 
 
 def home_markup():
@@ -228,7 +231,7 @@ def home_markup():
         [InlineKeyboardButton(p["name"], callback_data=f"p:{k}")]
         for k, p in PRODUCTS.items()
     ]
-    rows.append([InlineKeyboardButton("💬 Contact Admin", url=CONTACT_URL)])
+    rows.append([InlineKeyboardButton("💬 Contact Admin (Database)", url=CONTACT_URL)])
     rows.append([InlineKeyboardButton("📋 My Subscriptions", callback_data="my")])
     return InlineKeyboardMarkup(rows)
 
@@ -264,11 +267,11 @@ async def show_product(q, key):
         )
         await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
-    lines = [f"🎗 <b>VIP ACCESS PLANS</b> 🎗\n<b>{p['name']}</b>\n"]
-    for pl in plans_of(key):
-        lines.append(f"{pl['label']} - ₹{pl['price']}/- ⚡")
-    lines.append(f"\n📜 <b>Terms:</b>\n{esc(p['terms'])}")
-    lines.append("\n👇 Apna plan select karein")
+    lines = [
+        f"🎗 <b>VIP ACCESS PLANS</b> 🎗\n<b>{p['name']}</b>",
+        f"\n📜 <b>Terms:</b>\n{esc(p['terms'])}",
+        "\n👇 Apna plan select karein",
+    ]
     rows = [
         [
             InlineKeyboardButton(
