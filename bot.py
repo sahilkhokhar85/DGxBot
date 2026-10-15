@@ -295,10 +295,10 @@ async def show_payment(q, context, key, pid):
     text = (
         f"<b>{PRODUCTS[key]['name']}</b>\n"
         f"📦 Plan: <b>{pl['label']} — ₹{pl['price']}</b>\n\n"
-        "<b>Select Your Payout METHOD</b>\n"
-        "Normal Method :- Takes Time To Confirm ☘️\n\n"
-        "1. Pay Via UPI :- tap karke copy karein 👇\n"
-        f"<code>{esc(UPI_ID)}</code>\n"
+        "<b>Select Your Payout METHOD</b>\n\n"
+        '1. UPI :- "Tap👇Karke Copy Karein"\n'
+        f"→ <code>{esc(UPI_ID)}</code>\n\n"
+        "2. Binance Pay :- (Adding Soon)\n\n"
         "(Payment ke baad yahin <b>screenshot (photo)</b> bhejein)"
     )
     kb = InlineKeyboardMarkup(
